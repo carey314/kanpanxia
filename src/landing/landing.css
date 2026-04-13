@@ -1,0 +1,27 @@
+/* Landing Page 样式 */
+
+.landing-page {
+  --color-accent: #f59e0b;
+  --color-profit: #10b981;
+  --color-loss: #ef4444;
+}
+
+/* 平滑滚动 */
+html {
+  scroll-behavior: smooth;
+}
+
+/* 隐藏 React Bits 组件可能的溢出 */
+.landing-page section {
+  overflow: hidden;
+}
+
+/* Hero 渐变遮罩 */
+.hero-gradient {
+  background: linear-gradient(
+    180deg,
+    rgba(10, 10, 11, 0) 0%,
+    rgba(10, 10, 11, 0.8) 70%,
+    rgba(10, 10, 11, 1) 100%
+  );
+}
