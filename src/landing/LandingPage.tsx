@@ -37,7 +37,7 @@ export default function LandingPage() {
         {/* ====== Hero ====== */}
         <section className="relative min-h-screen flex flex-col items-center justify-center px-6">
           <div className="absolute inset-0 z-0 opacity-60">
-            <Aurora colorStops={['#f59e0b22', '#ea580c22', '#f59e0b22']} speed={0.3} />
+            <Aurora colorStops={['#f59e0b', '#ea580c', '#f59e0b']} speed={0.3} />
           </div>
           <div className="absolute inset-0 z-0 hero-gradient" />
 
@@ -337,7 +337,7 @@ export default function LandingPage() {
         {/* ====== CTA ====== */}
         <section className="py-32 px-6 text-center relative">
           <div className="absolute inset-0 z-0 opacity-30">
-            <Aurora colorStops={['#f59e0b11', '#ea580c11', '#f59e0b11']} speed={0.2} />
+            <Aurora colorStops={['#f59e0b', '#ea580c', '#f59e0b']} speed={0.2} />
           </div>
           <div className="relative z-10">
             <AnimatedContent distance={40} direction="vertical">
