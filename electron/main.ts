@@ -6,102 +6,45 @@ import http from 'http'
 import net from 'net'
 import { fileURLToPath } from 'url'
 import { spawn, type ChildProcess } from 'child_process'
-import * as pty from 'node-pty'
+import cron from 'node-cron'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
 const CWD = os.homedir() + '/projects/AI_Project/todoDemo/claude盯盘'
+const SCRIPTS = path.join(CWD, 'scripts')
 const TRADING_DATA_PATH = path.join(CWD, 'trading-data.json')
+const SCAN_RESULT_PATH = path.join(CWD, 'scan_result.json')
 
 let mainWindow: BrowserWindow | null = null
 let tray: Tray | null = null
-let shell: pty.IPty | null = null
 let ttydProcess: ChildProcess | null = null
+const APP_PORT = 18080
 
-// ---- trading-data.json 实时监听 ----
-function readTradingData(): any {
-  try {
-    return JSON.parse(fs.readFileSync(TRADING_DATA_PATH, 'utf-8'))
-  } catch {
-    return null
+// ============================================================
+// 工具函数
+// ============================================================
+
+function readJSON(filepath: string): any {
+  try { return JSON.parse(fs.readFileSync(filepath, 'utf-8')) } catch { return null }
+}
+
+function writeJSON(filepath: string, data: any) {
+  fs.writeFileSync(filepath, JSON.stringify(data, null, 2), 'utf-8')
+}
+
+function pushToFrontend(data: any) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('trading-data:updated', data)
+    console.log(`[push] 数据已推送到前端 ${new Date().toLocaleTimeString('zh-CN')}`)
   }
 }
 
-function watchTradingData() {
-  let debounce: ReturnType<typeof setTimeout> | null = null
-  fs.watch(TRADING_DATA_PATH, () => {
-    if (debounce) clearTimeout(debounce)
-    debounce = setTimeout(() => {
-      const data = readTradingData()
-      if (data && mainWindow) {
-        console.log('[data] trading-data.json 变更，推送到前端')
-        mainWindow.webContents.send('trading-data:updated', data)
-      }
-    }, 300)
-  })
-  console.log('[data] 监听', TRADING_DATA_PATH)
+function log(tag: string, msg: string) {
+  console.log(`[${tag}] ${msg}`)
 }
 
-ipcMain.handle('trading-data:get', () => readTradingData())
-
-// ---- ttyd 管理（生产模式下为前端终端提供服务）----
-function startTtyd() {
-  const env = { ...process.env }
-  delete env.CLAUDECODE
-  delete env.CLAUDE_CODE
-
-  ttydProcess = spawn('ttyd', [
-    '--port', '7681',
-    '--writable',
-    '--base-path', '/terminal',
-    '--max-clients', '5',
-    '/bin/zsh', '-l',
-  ], {
-    cwd: CWD,
-    env,
-    stdio: 'pipe',
-  })
-
-  ttydProcess.on('error', (err) => {
-    console.error('[ttyd] 启动失败:', err.message)
-    console.error('[ttyd] 请确保已安装 ttyd: brew install ttyd')
-  })
-
-  ttydProcess.stderr?.on('data', () => {})
-  console.log('[ttyd] 已启动 http://localhost:7681/terminal/')
-}
-
-// ---- PTY 管理 ----
-function createShell() {
-  // 清除嵌套检测
-  const env = { ...process.env }
-  delete env.CLAUDECODE
-  delete env.CLAUDE_CODE
-
-  shell = pty.spawn(process.env.SHELL || '/bin/zsh', ['-l'], {
-    name: 'xterm-256color',
-    cols: 120,
-    rows: 30,
-    cwd: CWD,
-    env,
-  })
-
-  shell.onData((data) => {
-    mainWindow?.webContents.send('terminal:data', data)
-  })
-
-  shell.onExit(({ exitCode }) => {
-    mainWindow?.webContents.send('terminal:exit', exitCode)
-    // 自动重启 shell
-    setTimeout(() => {
-      createShell()
-      mainWindow?.webContents.send('terminal:ready')
-    }, 500)
-  })
-}
-
-// ---- 环境检测 IPC ----
+/** 执行 shell 命令并返回 stdout */
 function execCmd(cmd: string): Promise<string> {
   return new Promise((resolve) => {
     const child = spawn('/bin/zsh', ['-lc', cmd], { env: process.env })
@@ -113,63 +56,196 @@ function execCmd(cmd: string): Promise<string> {
   })
 }
 
+/** 执行 Python 脚本，返回 JSON 结果 */
+function runPython(script: string): Promise<any> {
+  return new Promise((resolve) => {
+    const child = spawn('python3', [script], {
+      cwd: CWD,
+      env: { ...process.env, NO_PROXY: '*', PYTHONIOENCODING: 'utf-8' },
+    })
+    let stdout = ''
+    let stderr = ''
+    child.stdout?.on('data', (d: Buffer) => { stdout += d.toString() })
+    child.stderr?.on('data', (d: Buffer) => { stderr += d.toString() })
+    child.on('close', (code) => {
+      if (code === 0 && stdout.trim()) {
+        try { resolve(JSON.parse(stdout.trim())) } catch { resolve(null) }
+      } else {
+        log('python', `脚本 ${path.basename(script)} 失败: ${stderr.slice(0, 200)}`)
+        resolve(null)
+      }
+    })
+    child.on('error', () => resolve(null))
+  })
+}
+
+// ============================================================
+// 数据引擎：统一管理 trading-data.json
+// ============================================================
+
+ipcMain.handle('trading-data:get', () => readJSON(TRADING_DATA_PATH))
+
+/** 监听 trading-data.json 变化 → 推送到前端 */
+function watchTradingData() {
+  if (!fs.existsSync(TRADING_DATA_PATH)) return
+  let debounce: ReturnType<typeof setTimeout> | null = null
+  fs.watch(TRADING_DATA_PATH, () => {
+    if (debounce) clearTimeout(debounce)
+    debounce = setTimeout(() => {
+      const data = readJSON(TRADING_DATA_PATH)
+      if (data) pushToFrontend(data)
+    }, 300)
+  })
+  log('data', `监听 ${TRADING_DATA_PATH}`)
+}
+
+/** 拉取实时行情 → 合并到 JSON → 推送 */
+async function refreshMarketData() {
+  log('task', '拉取实时行情...')
+  const realtime = await runPython(path.join(SCRIPTS, 'fetch_realtime.py'))
+  if (!realtime) { log('task', '行情拉取失败'); return }
+
+  // 调用 update_json.py 合并
+  const child = spawn('python3', [path.join(SCRIPTS, 'update_json.py')], {
+    cwd: CWD,
+    env: { ...process.env, NO_PROXY: '*', PYTHONIOENCODING: 'utf-8' },
+  })
+  child.stdin?.write(JSON.stringify(realtime))
+  child.stdin?.end()
+
+  let result = ''
+  child.stdout?.on('data', (d: Buffer) => { result += d.toString() })
+  child.on('close', () => {
+    log('task', `行情更新: ${result.trim()}`)
+    // fs.watch 会自动触发 pushToFrontend
+  })
+}
+
+/** 跑连板扫描 → 合并到 JSON → 推送 */
+async function runDailyScan() {
+  log('task', '执行连板扫描...')
+  const scanScript = path.join(CWD, 'scan_next_day.py')
+  if (!fs.existsSync(scanScript)) { log('task', 'scan_next_day.py 不存在'); return }
+
+  await runPython(scanScript)
+
+  // 扫描结果合并到 trading-data.json
+  const child = spawn('python3', [path.join(SCRIPTS, 'update_json.py')], {
+    cwd: CWD,
+    env: { ...process.env, NO_PROXY: '*', PYTHONIOENCODING: 'utf-8' },
+  })
+  child.stdin?.end() // 不传 stdin，update_json.py 会自动读 scan_result.json
+  child.on('close', () => log('task', '扫描结果已合并'))
+}
+
+// ============================================================
+// 定时任务调度（node-cron）
+// ============================================================
+
+function setupCronJobs() {
+  // 盘中行情刷新：交易日 9:30-15:00 每5分钟
+  cron.schedule('*/5 9-14 * * 1-5', () => {
+    const hour = new Date().getHours()
+    const min = new Date().getMinutes()
+    // 9:30 之前不跑
+    if (hour === 9 && min < 30) return
+    refreshMarketData()
+  }, { timezone: 'Asia/Shanghai' })
+
+  // 15:00 最后一次刷新
+  cron.schedule('0 15 * * 1-5', () => {
+    refreshMarketData()
+  }, { timezone: 'Asia/Shanghai' })
+
+  // 15:05 连板扫描
+  cron.schedule('5 15 * * 1-5', () => {
+    runDailyScan()
+  }, { timezone: 'Asia/Shanghai' })
+
+  // 8:57 盘前刷新
+  cron.schedule('57 8 * * 1-5', () => {
+    refreshMarketData()
+  }, { timezone: 'Asia/Shanghai' })
+
+  log('cron', '定时任务已注册:')
+  log('cron', '  08:57      盘前行情')
+  log('cron', '  09:30-15:00 每5分钟刷新行情')
+  log('cron', '  15:05      连板扫描')
+}
+
+// 手动触发刷新（前端刷新按钮）
+ipcMain.handle('market:refresh', async () => {
+  await refreshMarketData()
+  return { success: true }
+})
+
+ipcMain.handle('scan:run', async () => {
+  await runDailyScan()
+  return { success: true }
+})
+
+// ============================================================
+// ttyd 终端
+// ============================================================
+
+function startTtyd() {
+  const env = { ...process.env }
+  delete env.CLAUDECODE
+  delete env.CLAUDE_CODE
+
+  ttydProcess = spawn('ttyd', [
+    '--port', '7681', '--writable',
+    '--base-path', '/terminal', '--max-clients', '5',
+    '/bin/zsh', '-l',
+  ], { cwd: CWD, env, stdio: 'pipe' })
+
+  ttydProcess.on('error', (err) => log('ttyd', `启动失败: ${err.message}`))
+  ttydProcess.stderr?.on('data', () => {})
+  log('ttyd', 'http://localhost:7681/terminal/')
+}
+
+// ============================================================
+// 环境检测 IPC
+// ============================================================
+
 ipcMain.handle('env:check', async () => {
   const [ttydPath, claudePath, brewPath, ttydPort] = await Promise.all([
-    execCmd('which ttyd'),
-    execCmd('which claude'),
-    execCmd('which brew'),
-    execCmd('lsof -i :7681 -t'),
+    execCmd('which ttyd'), execCmd('which claude'),
+    execCmd('which brew'), execCmd('lsof -i :7681 -t'),
   ])
   return {
-    hasBrew: !!brewPath,
-    hasTtyd: !!ttydPath,
-    hasClaude: !!claudePath,
-    ttydRunning: !!ttydPort,
-    ttydPath,
-    claudePath,
-    platform: process.platform,
-    arch: process.arch,
+    hasBrew: !!brewPath, hasTtyd: !!ttydPath, hasClaude: !!claudePath,
+    ttydRunning: !!ttydPort, ttydPath, claudePath,
+    platform: process.platform, arch: process.arch,
   }
 })
 
 ipcMain.handle('env:setup-ttyd', async () => {
   const result = await execCmd('brew install ttyd 2>&1')
-  return { success: result.includes('already installed') || !result.includes('Error'), output: result }
+  return { success: !result.includes('Error'), output: result }
 })
 
 ipcMain.handle('env:setup-service', async () => {
   const plistPath = `${os.homedir()}/Library/LaunchAgents/com.carey.ttyd.plist`
   const ttydPath = (await execCmd('which ttyd')).trim()
   if (!ttydPath) return { success: false, output: '请先安装 ttyd' }
-
   const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
+<plist version="1.0"><dict>
   <key>Label</key><string>com.carey.ttyd</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>${ttydPath}</string>
-    <string>--port</string><string>7681</string>
-    <string>--writable</string>
-    <string>--base-path</string><string>/terminal</string>
-    <string>--max-clients</string><string>5</string>
-    <string>/bin/zsh</string><string>-l</string>
+  <key>ProgramArguments</key><array>
+    <string>${ttydPath}</string><string>--port</string><string>7681</string>
+    <string>--writable</string><string>--base-path</string><string>/terminal</string>
+    <string>--max-clients</string><string>5</string><string>/bin/zsh</string><string>-l</string>
   </array>
   <key>WorkingDirectory</key><string>${CWD}</string>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/tmp/ttyd.log</string>
-  <key>StandardErrorPath</key><string>/tmp/ttyd.err</string>
-</dict>
-</plist>`
-
+  <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+</dict></plist>`
   fs.writeFileSync(plistPath, plist)
   await execCmd(`launchctl unload ${plistPath} 2>/dev/null; launchctl load ${plistPath}`)
-  // 等 ttyd 启动
   await new Promise(r => setTimeout(r, 1500))
   const check = await execCmd('lsof -i :7681 -t')
-  return { success: !!check, output: check ? '服务已启动' : '启动失败，请手动运行 ttyd' }
+  return { success: !!check, output: check ? '服务已启动' : '启动失败' }
 })
 
 ipcMain.handle('env:setup-claude', async () => {
@@ -177,108 +253,69 @@ ipcMain.handle('env:setup-claude', async () => {
   return { success: !result.includes('ERR'), output: result }
 })
 
-// ---- 交易数据 JSON 读取 + 文件监听 ----
-function readTradingData(): any {
-  try {
-    const raw = fs.readFileSync(TRADING_DATA_PATH, 'utf-8')
-    return JSON.parse(raw)
-  } catch (err) {
-    console.error('[trading-data] 读取失败:', err)
-    return null
-  }
-}
+ipcMain.on('env:skip', () => {})
 
-ipcMain.handle('trading-data:get', () => {
-  return readTradingData()
-})
+// ============================================================
+// 终端 IPC（PTY — 备用，主要用 ttyd）
+// ============================================================
 
-// ---- IPC ----
-ipcMain.on('terminal:input', (_e, data: string) => {
-  shell?.write(data)
-})
+let shell: any = null
+ipcMain.on('terminal:input', (_e, data: string) => shell?.write(data))
+ipcMain.on('terminal:resize', (_e, cols: number, rows: number) => shell?.resize(cols, rows))
+ipcMain.on('terminal:restart', () => {})
 
-ipcMain.on('terminal:resize', (_e, cols: number, rows: number) => {
-  shell?.resize(cols, rows)
-})
+// ============================================================
+// 窗口
+// ============================================================
 
-ipcMain.on('terminal:restart', () => {
-  shell?.kill()
-  createShell()
-  mainWindow?.webContents.send('terminal:ready')
-})
-
-// ---- 窗口 ----
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 1400,
-    height: 900,
-    minWidth: 1000,
-    minHeight: 600,
+    width: 1400, height: 900, minWidth: 1000, minHeight: 600,
     titleBarStyle: 'hiddenInset',
     trafficLightPosition: { x: 12, y: 12 },
     backgroundColor: '#18191c',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
-      nodeIntegration: false,
-      contextIsolation: true,
-      webSecurity: false,  // 允许 iframe 跨域加载 ttyd
+      nodeIntegration: false, contextIsolation: true,
+      webSecurity: false,
     },
   })
 
-  // 开发 or 生产
   if (process.env.VITE_DEV_SERVER_URL) {
     mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL)
   } else {
     mainWindow.loadURL(`http://127.0.0.1:${APP_PORT}`)
   }
 
-  // 关闭窗口→隐藏到托盘
   mainWindow.on('close', (e) => {
-    if (!app.isQuitting) {
-      e.preventDefault()
-      mainWindow?.hide()
-    }
+    if (!app.isQuitting) { e.preventDefault(); mainWindow?.hide() }
   })
-
-  mainWindow.on('closed', () => {
-    mainWindow = null
-  })
-
-  // 窗口就绪后启动 PTY
-  mainWindow.webContents.on('did-finish-load', () => {
-    if (!shell) {
-      createShell()
-    }
-    mainWindow?.webContents.send('terminal:ready')
-  })
+  mainWindow.on('closed', () => { mainWindow = null })
 }
 
-// ---- 托盘 ----
+// ============================================================
+// 托盘
+// ============================================================
+
 function createTray() {
-  // macOS 托盘图标（用 emoji 生成）
   const icon = nativeImage.createFromDataURL(
     'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAABHNCSVQICAgIfAhkiAAAAAlwSFlzAAAAbwAAAG8B8aLcQwAAABl0RVh0U29mdHdhcmUAd3d3Lmlua3NjYXBlLm9yZ5vuPBoAAABNSURBVDiNY/z//z8DEwMDAwMDAxMDGQCSZoIrpKsBjKQawMjIyEA2A/7//89ENgMYGRnJZgDIFSQbAHIFyQYwkssARkZGxv///5NsAABELQ0fk/hIHwAAAABJRU5ErkJggg=='
   )
   tray = new Tray(icon.resize({ width: 16, height: 16 }))
   tray.setToolTip('看盘侠')
-
-  const contextMenu = Menu.buildFromTemplate([
+  tray.setContextMenu(Menu.buildFromTemplate([
     { label: '显示窗口', click: () => mainWindow?.show() },
+    { label: '刷新行情', click: () => refreshMarketData() },
+    { label: '连板扫描', click: () => runDailyScan() },
     { type: 'separator' },
-    {
-      label: '退出', click: () => {
-        app.isQuitting = true
-        shell?.kill()
-        app.quit()
-      }
-    },
-  ])
-  tray.setContextMenu(contextMenu)
+    { label: '退出', click: () => { app.isQuitting = true; app.quit() } },
+  ]))
   tray.on('click', () => mainWindow?.show())
 }
 
-// ---- 生产模式：全局 HTTP 服务 + ttyd（只启动一次）----
-const APP_PORT = 18080
+// ============================================================
+// 生产模式 HTTP 服务
+// ============================================================
 
 function startProductionServer() {
   startTtyd()
@@ -289,16 +326,13 @@ function startProductionServer() {
     '.json': 'application/json', '.png': 'image/png', '.svg': 'image/svg+xml',
   }
 
-  const localServer = http.createServer((req, res) => {
-    // /trading-data.json → 实时读取
+  const server = http.createServer((req, res) => {
     if (req.url === '/trading-data.json') {
-      const data = readTradingData()
+      const data = readJSON(TRADING_DATA_PATH)
       res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' })
       res.end(JSON.stringify(data))
       return
     }
-
-    // /terminal/ 代理到 ttyd
     if (req.url?.startsWith('/terminal')) {
       const proxy = http.request(
         { hostname: '127.0.0.1', port: 7681, path: req.url, method: req.method, headers: req.headers },
@@ -308,17 +342,6 @@ function startProductionServer() {
       proxy.on('error', () => res.end())
       return
     }
-
-    // 服务 trading-data.json（实时数据）
-    if (req.url === '/trading-data.json') {
-      try {
-        const content = fs.readFileSync(TRADING_DATA_PATH, 'utf-8')
-        res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(content)
-      } catch { res.writeHead(404); res.end() }
-      return
-    }
-
     let filePath = path.join(distPath, req.url === '/' ? 'index.html' : req.url || '')
     if (!fs.existsSync(filePath)) filePath = path.join(distPath, 'index.html')
     const ext = path.extname(filePath)
@@ -326,13 +349,11 @@ function startProductionServer() {
     fs.createReadStream(filePath).pipe(res)
   })
 
-  // WebSocket 代理（ttyd 终端需要）
-  localServer.on('upgrade', (req, socket, head) => {
+  server.on('upgrade', (req, socket, head) => {
     if (req.url?.startsWith('/terminal')) {
       const upstream = net.connect(7681, '127.0.0.1', () => {
-        const rawReq = `GET ${req.url} HTTP/1.1\r\n` +
-          Object.entries(req.headers).map(([k, v]) => `${k}: ${v}`).join('\r\n') + '\r\n\r\n'
-        upstream.write(rawReq)
+        upstream.write(`GET ${req.url} HTTP/1.1\r\n` +
+          Object.entries(req.headers).map(([k, v]) => `${k}: ${v}`).join('\r\n') + '\r\n\r\n')
         upstream.write(head)
         socket.pipe(upstream).pipe(socket)
       })
@@ -341,35 +362,23 @@ function startProductionServer() {
     }
   })
 
-  localServer.listen(APP_PORT, '127.0.0.1', () => {
-    console.log(`[app] http://127.0.0.1:${APP_PORT}`)
-  })
+  server.listen(APP_PORT, '127.0.0.1', () => log('http', `http://127.0.0.1:${APP_PORT}`))
 }
 
-// ---- 启动 ----
+// ============================================================
+// 启动
+// ============================================================
+
 app.whenReady().then(() => {
-  if (!process.env.VITE_DEV_SERVER_URL) {
-    startProductionServer()
-  }
+  if (!process.env.VITE_DEV_SERVER_URL) startProductionServer()
+
   watchTradingData()
+  setupCronJobs()
   createWindow()
   createTray()
 
-  // 监听 trading-data.json 变化，推送到渲染进程
-  if (fs.existsSync(TRADING_DATA_PATH)) {
-    let watchDebounce: NodeJS.Timeout | null = null
-    fs.watch(TRADING_DATA_PATH, () => {
-      if (watchDebounce) clearTimeout(watchDebounce)
-      watchDebounce = setTimeout(() => {
-        const data = readTradingData()
-        if (data && mainWindow) {
-          mainWindow.webContents.send('trading-data:updated', data)
-          console.log('[trading-data] 数据已更新，已推送到UI')
-        }
-      }, 300)
-    })
-    console.log('[trading-data] 正在监听:', TRADING_DATA_PATH)
-  }
+  // 启动后立刻刷新一次行情
+  setTimeout(() => refreshMarketData(), 3000)
 
   app.on('activate', () => {
     if (!mainWindow) createWindow()
@@ -378,23 +387,13 @@ app.whenReady().then(() => {
 })
 
 app.on('window-all-closed', () => {
-  // macOS: 不退出，保持托盘
-  if (process.platform !== 'darwin') {
-    app.quit()
-  }
+  if (process.platform !== 'darwin') app.quit()
 })
 
 app.on('before-quit', () => {
   app.isQuitting = true
-  shell?.kill()
   ttydProcess?.kill()
 })
 
-// 扩展 app 类型
-declare module 'electron' {
-  interface App {
-    isQuitting: boolean
-  }
-}
-
+declare module 'electron' { interface App { isQuitting: boolean } }
 app.isQuitting = false

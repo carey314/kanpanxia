@@ -29,6 +29,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
     return () => ipcRenderer.removeListener('trading-data:updated', listener)
   },
 
+  // 手动触发
+  refreshMarket: () => ipcRenderer.invoke('market:refresh'),
+  runScan: () => ipcRenderer.invoke('scan:run'),
+
   // 环境检测 & 安装
   checkEnv: () => ipcRenderer.invoke('env:check'),
   setupTtyd: () => ipcRenderer.invoke('env:setup-ttyd'),
